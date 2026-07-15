@@ -56,6 +56,47 @@
     });
   }
 
+  /* ---------------- same-origin rerouting
+     Cross-origin API calls are rerouted through the mirror's
+     /__facet/net/<origin>/ passthrough so the browser only ever sees
+     same-origin requests — no CORS preflights, no backend changes. */
+  function reroute(url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.origin === location.origin) return url;
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return url;
+      return `${location.origin}/__facet/net/${encodeURIComponent(u.origin)}${u.pathname}${u.search}`;
+    } catch (_) {
+      return url;
+    }
+  }
+
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    if (typeof input === 'string' || input instanceof URL) {
+      return nativeFetch(reroute(String(input)), init);
+    }
+    if (input instanceof Request) {
+      const rerouted = reroute(input.url);
+      return nativeFetch(rerouted === input.url ? input : new Request(rerouted, input), init);
+    }
+    return nativeFetch(input, init);
+  };
+
+  const nativeXhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    return nativeXhrOpen.call(this, method, reroute(String(url)), ...rest);
+  };
+
+  if (window.EventSource) {
+    const NativeEventSource = window.EventSource;
+    window.EventSource = function (url, opts) {
+      return new NativeEventSource(reroute(String(url)), opts);
+    };
+    window.EventSource.prototype = NativeEventSource.prototype;
+    Object.assign(window.EventSource, NativeEventSource);
+  }
+
   /* ---------------- websocket bus */
   let ws = null;
   let applying = false;      // true while replaying a remote event
