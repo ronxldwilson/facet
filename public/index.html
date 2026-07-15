@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>facet — one site, every aspect</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">◈ facet</div>
+    <form id="target-form">
+      <input id="target-url" type="url" placeholder="https://your-site.local:5173 or any URL" required />
+      <button type="submit">Render</button>
+    </form>
+    <div id="preset-toggles"></div>
+  </header>
+  <main id="grid">
+    <div class="empty">Enter a URL above — facet renders it in every aspect at once.<br/>
+      Click, type, scroll or navigate in any pane and every other pane follows.</div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
