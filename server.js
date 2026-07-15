@@ -9,6 +9,7 @@
  *          WebSocket bus that fans interactions out to every pane.
  */
 const http = require('http');
+const crypto = require('crypto');
 const { Readable } = require('stream');
 const fs = require('fs');
 const path = require('path');
@@ -33,7 +34,11 @@ function serveFile(res, filePath) {
       res.writeHead(404).end('not found');
       return;
     }
-    res.writeHead(200, { 'content-type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+    res.writeHead(200, {
+      'content-type': MIME[path.extname(filePath)] || 'application/octet-stream',
+      // facet's own assets must never be stale-cached across facet updates
+      'cache-control': 'no-store',
+    });
     res.end(buf);
   });
 }
@@ -104,13 +109,7 @@ const STRIP_REQUEST_HEADERS = new Set([
 
 const INJECT_TAG = '<script src="/__facet/sync-client.js"></script>';
 
-/**
- * Forward a request to `upstream` and write the response to `res`.
- * When `injectInto` is set (the origin being mirrored), HTML responses get
- * the sync client injected; everything else streams through untouched, so
- * SSE / streaming responses work.
- */
-async function forward(req, res, upstream, { injectInto = null } = {}) {
+function buildUpstreamHeaders(req, upstream) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (!STRIP_REQUEST_HEADERS.has(k.toLowerCase())) headers[k] = v;
@@ -118,24 +117,10 @@ async function forward(req, res, upstream, { injectInto = null } = {}) {
   headers['host'] = upstream.host;
   headers['origin'] = upstream.origin;
   headers['accept-encoding'] = 'identity';
+  return headers;
+}
 
-  let body;
-  if (req.method !== 'GET' && req.method !== 'HEAD') body = await readBody(req);
-
-  let response;
-  try {
-    response = await fetch(upstream, {
-      method: req.method,
-      headers,
-      body,
-      redirect: 'manual',
-    });
-  } catch (e) {
-    res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end(`facet proxy error: ${e.message}`);
-    return;
-  }
-
+function buildDownstreamHeaders(response, upstream) {
   const outHeaders = {};
   for (const [k, v] of response.headers.entries()) {
     if (STRIP_RESPONSE_HEADERS.has(k)) continue;
@@ -155,12 +140,48 @@ async function forward(req, res, upstream, { injectInto = null } = {}) {
       c.replace(/;\s*Domain=[^;]*/gi, '').replace(/;\s*Secure/gi, '')
     );
   }
+  return outHeaders;
+}
+
+/**
+ * Forward a request to `upstream` and write the response to `res`.
+ * When `injectInto` is set (the origin being mirrored), HTML responses get
+ * the sync client injected; everything else streams through untouched, so
+ * SSE / streaming responses work.
+ */
+async function forward(req, res, upstream, { injectInto = null } = {}) {
+  let body;
+  if (req.method !== 'GET' && req.method !== 'HEAD') body = await readBody(req);
+
+  let response;
+  try {
+    response = await fetch(upstream, {
+      method: req.method,
+      headers: buildUpstreamHeaders(req, upstream),
+      body,
+      // mirrored pages: follow redirects server-side so a cross-origin hop
+      // (google.com → www.google.com) can never carry the iframe out of the
+      // mirror; API passthrough keeps redirects manual for the client to see
+      redirect: injectInto ? 'follow' : 'manual',
+    });
+  } catch (e) {
+    res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end(`facet proxy error: ${e.message}`);
+    return;
+  }
+
+  const outHeaders = buildDownstreamHeaders(response, upstream);
 
   const contentType = response.headers.get('content-type') || '';
   if (injectInto && contentType.includes('text/html')) {
     let html = await response.text();
-    // absolute same-origin URLs → mirror-relative so they stay proxied
+    // absolute same-origin URLs → mirror-relative so they stay proxied;
+    // also rewrite the post-redirect origin (e.g. www.google.com) if it moved
     html = html.split(injectInto).join('');
+    if (response.url) {
+      const finalOrigin = new URL(response.url).origin;
+      if (finalOrigin !== injectInto) html = html.split(finalOrigin).join('');
+    }
     // inject the sync client as early as possible so it runs before site JS
     if (/<head[^>]*>/i.test(html)) {
       html = html.replace(/<head[^>]*>/i, (m) => m + INJECT_TAG);
@@ -180,6 +201,120 @@ async function forward(req, res, upstream, { injectInto = null } = {}) {
   }
   // stream so SSE / chunked responses (e.g. LLM chat) pass through live
   Readable.fromWeb(response.body).pipe(res);
+}
+
+/* ------------------------------------------------------------------ */
+/* API dedup — panes replay the same interaction near-simultaneously,  */
+/* so identical requests within a short window hit the backend ONCE;   */
+/* every pane gets a copy of the single response, streamed live.       */
+/* ------------------------------------------------------------------ */
+
+const DEDUP_WINDOW_MS = Number(process.env.FACET_DEDUP_MS || 1500);
+const MAX_REPLAY_BYTES = 10 * 1024 * 1024; // stop buffering huge bodies for late joiners
+
+const inflight = new Map(); // dedup key -> entry
+
+function dedupKey(req, upstream, body) {
+  return crypto.createHash('sha1')
+    .update(req.method).update('\0')
+    .update(upstream.href).update('\0')
+    .update(req.headers.authorization || '').update('\0')
+    .update(req.headers.cookie || '').update('\0')
+    .update(body || '')
+    .digest('hex');
+}
+
+function attachFollower(entry, res) {
+  res.on('close', () => entry.followers.delete(res));
+  if (entry.status !== null) {
+    res.writeHead(entry.status, entry.headers);
+    for (const c of entry.chunks) res.write(c);
+    if (entry.done) {
+      res.end();
+      return;
+    }
+  } else {
+    entry.pending.push(res);
+  }
+  entry.followers.add(res);
+}
+
+function endEntry(entry, key) {
+  entry.done = true;
+  entry.endedAt = Date.now();
+  for (const r of entry.followers) r.end();
+  entry.followers.clear();
+  setTimeout(() => {
+    if (inflight.get(key) === entry) inflight.delete(key);
+  }, DEDUP_WINDOW_MS + 100).unref();
+}
+
+function flushHeaders(entry, status, headers) {
+  entry.status = status;
+  entry.headers = headers;
+  for (const r of entry.pending) r.writeHead(status, headers);
+  entry.pending = [];
+}
+
+async function forwardDeduped(req, res, upstream) {
+  let body = null;
+  if (req.method !== 'GET' && req.method !== 'HEAD') body = await readBody(req);
+
+  const key = dedupKey(req, upstream, body);
+  const existing = inflight.get(key);
+  if (existing && !existing.tooBig &&
+      (!existing.done || Date.now() - existing.endedAt < DEDUP_WINDOW_MS)) {
+    attachFollower(existing, res);
+    return;
+  }
+
+  const entry = {
+    status: null, headers: null, chunks: [], size: 0,
+    tooBig: false, done: false, endedAt: 0,
+    followers: new Set(), pending: [],
+  };
+  inflight.set(key, entry);
+  attachFollower(entry, res);
+
+  let response;
+  try {
+    response = await fetch(upstream, {
+      method: req.method,
+      headers: buildUpstreamHeaders(req, upstream),
+      body,
+      redirect: 'manual',
+    });
+  } catch (e) {
+    const msg = Buffer.from(`facet proxy error: ${e.message}`);
+    flushHeaders(entry, 502, { 'content-type': 'text/plain' });
+    entry.chunks.push(msg);
+    for (const r of entry.followers) r.write(msg);
+    endEntry(entry, key);
+    return;
+  }
+
+  flushHeaders(entry, response.status, buildDownstreamHeaders(response, upstream));
+
+  if (!response.body) {
+    endEntry(entry, key);
+    return;
+  }
+
+  const stream = Readable.fromWeb(response.body);
+  stream.on('data', (chunk) => {
+    if (!entry.tooBig) {
+      entry.size += chunk.length;
+      if (entry.size > MAX_REPLAY_BYTES) {
+        entry.tooBig = true; // stop replay for late joiners, keep live followers
+        entry.chunks = [];
+      } else {
+        entry.chunks.push(chunk);
+      }
+    }
+    for (const r of entry.followers) r.write(chunk);
+  });
+  stream.on('end', () => endEntry(entry, key));
+  stream.on('error', () => endEntry(entry, key));
 }
 
 const proxy = http.createServer(async (req, res) => {
@@ -203,7 +338,7 @@ const proxy = http.createServer(async (req, res) => {
       return;
     }
     const upstream = new URL(slash === -1 ? '/' : rest.slice(slash), origin);
-    await forward(req, res, upstream);
+    await forwardDeduped(req, res, upstream);
     return;
   }
 
