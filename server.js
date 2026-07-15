@@ -9,6 +9,7 @@
  *          WebSocket bus that fans interactions out to every pane.
  */
 const http = require('http');
+const { Readable } = require('stream');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
@@ -103,26 +104,19 @@ const STRIP_REQUEST_HEADERS = new Set([
 
 const INJECT_TAG = '<script src="/__facet/sync-client.js"></script>';
 
-const proxy = http.createServer(async (req, res) => {
-  if (req.url.startsWith('/__facet/sync-client.js')) {
-    serveFile(res, path.join(__dirname, 'inject', 'sync-client.js'));
-    return;
-  }
-
-  if (!target) {
-    res.writeHead(503, { 'content-type': 'text/html' });
-    res.end('<h2 style="font-family:sans-serif">facet: no target set — open the dashboard and enter a URL.</h2>');
-    return;
-  }
-
-  const targetOrigin = new URL(target).origin;
-  const upstream = new URL(req.url, targetOrigin);
-
+/**
+ * Forward a request to `upstream` and write the response to `res`.
+ * When `injectInto` is set (the origin being mirrored), HTML responses get
+ * the sync client injected; everything else streams through untouched, so
+ * SSE / streaming responses work.
+ */
+async function forward(req, res, upstream, { injectInto = null } = {}) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (!STRIP_REQUEST_HEADERS.has(k.toLowerCase())) headers[k] = v;
   }
-  headers['host'] = new URL(targetOrigin).host;
+  headers['host'] = upstream.host;
+  headers['origin'] = upstream.origin;
   headers['accept-encoding'] = 'identity';
 
   let body;
@@ -146,9 +140,9 @@ const proxy = http.createServer(async (req, res) => {
   for (const [k, v] of response.headers.entries()) {
     if (STRIP_RESPONSE_HEADERS.has(k)) continue;
     if (k === 'location') {
-      // keep same-origin redirects inside the mirror
-      outHeaders[k] = v.startsWith(targetOrigin)
-        ? v.slice(targetOrigin.length) || '/'
+      // keep same-origin redirects inside the proxy
+      outHeaders[k] = v.startsWith(upstream.origin)
+        ? v.slice(upstream.origin.length) || '/'
         : v;
       continue;
     }
@@ -163,10 +157,10 @@ const proxy = http.createServer(async (req, res) => {
   }
 
   const contentType = response.headers.get('content-type') || '';
-  if (contentType.includes('text/html')) {
+  if (injectInto && contentType.includes('text/html')) {
     let html = await response.text();
     // absolute same-origin URLs → mirror-relative so they stay proxied
-    html = html.split(targetOrigin).join('');
+    html = html.split(injectInto).join('');
     // inject the sync client as early as possible so it runs before site JS
     if (/<head[^>]*>/i.test(html)) {
       html = html.replace(/<head[^>]*>/i, (m) => m + INJECT_TAG);
@@ -180,8 +174,47 @@ const proxy = http.createServer(async (req, res) => {
   }
 
   res.writeHead(response.status, outHeaders);
-  const buf = Buffer.from(await response.arrayBuffer());
-  res.end(buf);
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  // stream so SSE / chunked responses (e.g. LLM chat) pass through live
+  Readable.fromWeb(response.body).pipe(res);
+}
+
+const proxy = http.createServer(async (req, res) => {
+  if (req.url.startsWith('/__facet/sync-client.js')) {
+    serveFile(res, path.join(__dirname, 'inject', 'sync-client.js'));
+    return;
+  }
+
+  // Cross-origin passthrough: /__facet/net/<encoded-origin>/<path>
+  // The sync client reroutes the page's fetch/XHR calls here, so API
+  // requests stay same-origin in the browser and CORS never applies.
+  if (req.url.startsWith('/__facet/net/')) {
+    const rest = req.url.slice('/__facet/net/'.length);
+    const slash = rest.indexOf('/');
+    let origin;
+    try {
+      origin = new URL(decodeURIComponent(slash === -1 ? rest : rest.slice(0, slash))).origin;
+    } catch (_) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('facet: bad /__facet/net/ origin');
+      return;
+    }
+    const upstream = new URL(slash === -1 ? '/' : rest.slice(slash), origin);
+    await forward(req, res, upstream);
+    return;
+  }
+
+  if (!target) {
+    res.writeHead(503, { 'content-type': 'text/html' });
+    res.end('<h2 style="font-family:sans-serif">facet: no target set — open the dashboard and enter a URL.</h2>');
+    return;
+  }
+
+  const targetOrigin = new URL(target).origin;
+  await forward(req, res, new URL(req.url, targetOrigin), { injectInto: targetOrigin });
 });
 
 /* ------------------------------------------------------------------ */
