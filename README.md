@@ -20,6 +20,7 @@
 
 - **Mirror proxy** (`:4401`) serves the target site at its own root so all relative and root-relative URLs keep working, strips frame-blocking headers, and injects a small sync client at the top of `<head>`.
 - **Sync client** captures trusted clicks, input, select changes, form submits, scrolls (as a percentage) and SPA navigations, then broadcasts them over a WebSocket bus. Other panes replay them — inputs use the native value setter + synthetic `input` event so React-controlled forms update correctly.
+- **Same-origin rerouting**: the sync client patches `fetch`, `XMLHttpRequest` and `EventSource` before site JS runs, rerouting cross-origin API calls through the mirror's `/__facet/net/<origin>/` passthrough. The browser only ever sees same-origin requests, so CORS preflights never happen and the target app's backend needs **zero configuration changes**. Non-HTML responses stream through (SSE / chunked LLM responses work live).
 - **Aspect modes** ride in each iframe's `window.name` (so they survive navigation). Dark/light and reduced-motion are emulated by patching `matchMedia` before site JS runs; RTL flips `dir`; grayscale applies a root filter.
 
 ## Run
@@ -45,4 +46,5 @@ Open http://localhost:4400, enter a URL, hit **Render**. Toggle aspect presets i
 - Per-pane locale & timezone emulation
 - Hover mirroring with ghost cursors showing where other panes are pointing
 - Element-level scroll sync (inner scroll containers)
+- WebSocket passthrough (`ws://` API connections are not yet rerouted — only fetch/XHR/SSE)
 - Screenshot strip: capture all panes at once for visual review
